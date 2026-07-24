@@ -37,6 +37,7 @@ import {
   UnsupportedOAuthProviderError,
 } from "../../oauth";
 import { buildWebSearchTool, planWebSearch, runWithWebSearch, shouldResolveOpenAiWebSearchSidecar } from "../../web-search";
+import { buildImageTool, planImageBridge, runWithImageBridge } from "../../images";
 import { describeImagesInPlace, planVisionSidecar, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
 import { createAdapterEventQueue, preflightAdapterEvents } from "../../adapters/run-turn-queue";
 import {
@@ -1446,6 +1447,35 @@ export async function handleResponses(
       });
     }
     return wsResponse;
+  }
+
+  // Image bridge: Codex enabled image_generation but this is a routed (non-OpenAI) model that
+  // can't execute the OpenAI-hosted tool server-side. Intercept and run via xAI Grok Imagine.
+  const imgPlan = planImageBridge(config, parsed, route.provider);
+  if (imgPlan && !wsPlan) {
+    // The bridge forces stream:true internally and returns SSE. Non-streaming requests can't be
+    // served — reject explicitly rather than returning SSE to a client expecting JSON.
+    if (!parsed.stream) {
+      return new Response(JSON.stringify({ error: { message: "image bridge requires stream=true", type: "invalid_request_error", code: null } }), {
+        status: 400, headers: { "Content-Type": "application/json" },
+      });
+    }
+    parsed.context.tools = [...(parsed.context.tools ?? []), buildImageTool()];
+    const imgResponse = await runWithImageBridge({
+      parsed, adapter,
+      plan: imgPlan,
+      abortSignal: options.abortSignal,
+      ...(config.images?.maxRounds != null ? { maxRounds: config.images.maxRounds } : {}),
+      ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
+    });
+    if (imgResponse.body) {
+      const imgTurnAc = new AbortController();
+      return new Response(trackStreamLifetime(imgResponse.body, imgTurnAc), {
+        status: imgResponse.status,
+        headers: imgResponse.headers,
+      });
+    }
+    return imgResponse;
   }
 
   const upstream = new AbortController();
