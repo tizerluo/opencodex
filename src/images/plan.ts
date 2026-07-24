@@ -1,10 +1,12 @@
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../types";
-import type { ImageBridgePlan } from "./types";
+import type { ImageBridgePlan, VideoBridgePlan } from "./types";
 import { getCredential } from "../oauth/store";
 import { resolveEnvValue } from "../config";
-import { IMAGE_GEN_TOOL_NAME } from "./synthetic-tool";
+import { IMAGE_GEN_TOOL_NAME, VIDEO_GEN_TOOL_NAME } from "./synthetic-tool";
 
 const DEFAULT_MODEL = "grok-imagine-image-quality";
+
+const DEFAULT_VIDEO_MODEL = "grok-imagine-video";
 
 export function findXaiProvider(config: OcxConfig): OcxProviderConfig | undefined {
   // Primary: well-known name "xai"
@@ -50,6 +52,37 @@ export function planImageBridge(
     provider: xai,
     auth: { baseUrl: xai.baseUrl.replace(/\/+$/, ""), token },
     model: config.images?.bridgeModel ?? DEFAULT_MODEL,
+    toolNames,
+  };
+}
+
+/**
+ * Decide whether the video bridge should activate for this request. Unlike images, video
+ * generation has no hosted OpenAI tool type — the synthetic `video_gen` tool is unconditionally
+ * injected when `videoBridgeEnabled` is true. The bridge activates only when:
+ *   1. videoBridgeEnabled is explicitly true (opt-in)
+ *   2. the routed provider is NOT api.openai.com (native passthrough)
+ *   3. an xAI provider with a valid token is available
+ */
+export function planVideoBridge(
+  config: OcxConfig,
+  _parsed: OcxParsedRequest,
+  routedProvider: OcxProviderConfig,
+): VideoBridgePlan | undefined {
+  if (config.images?.videoBridgeEnabled !== true) return undefined;
+  // Don't intercept for OpenAI native passthrough
+  const host = (() => { try { return new URL(routedProvider.baseUrl).hostname; } catch { return ""; } })();
+  if (host === "api.openai.com") return undefined;
+  const xai = findXaiProvider(config);
+  if (!xai) return undefined;
+  const token = resolveXaiToken(xai);
+  if (!token) return undefined;
+  const toolNames = new Set<string>();
+  toolNames.add(VIDEO_GEN_TOOL_NAME);
+  return {
+    provider: xai,
+    auth: { baseUrl: xai.baseUrl.replace(/\/+$/, ""), token },
+    model: config.images?.videoBridgeModel ?? DEFAULT_VIDEO_MODEL,
     toolNames,
   };
 }

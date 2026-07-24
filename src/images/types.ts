@@ -1,13 +1,15 @@
 import type { OcxProviderConfig } from "../types";
 
-export interface ImageBridgePlan {
+/** Shared plan shape for image and video bridges. */
+export interface MediaBridgePlan {
   provider: OcxProviderConfig;
   auth: { baseUrl: string; token: string };
   model: string;
   toolNames: Set<string>;
 }
 
-export interface ImageCallResult {
+/** Shared result shape for image and video fulfillment. */
+export interface MediaCallResult {
   ok: boolean;
   model: string;
   prompt: string;
@@ -17,3 +19,9 @@ export interface ImageCallResult {
   markdown?: string;
   error?: string;
 }
+
+// Type aliases preserve existing import names.
+export type ImageBridgePlan = MediaBridgePlan;
+export type VideoBridgePlan = MediaBridgePlan;
+export type ImageCallResult = MediaCallResult;
+export type VideoCallResult = MediaCallResult;

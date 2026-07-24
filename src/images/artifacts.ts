@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, open, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { getConfigDir } from "../config";
 
@@ -135,4 +135,99 @@ export async function downloadImageToArtifact(
   const filePath = join(dir, `dl-${timestampPrefix()}-${crypto.randomUUID()}.${ext}`);
   await writeFile(filePath, bytes, { mode: 0o600 });
   return filePath;
+}
+
+const MAX_VIDEO_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MiB
+
+export interface VideoBudget {
+  spent: number;
+}
+
+export function createVideoBudget(): VideoBudget {
+  return { spent: 0 };
+}
+
+export function guessVideoExtFromMagic(bytes: Uint8Array): string {
+  const sig = Buffer.from(bytes.slice(0, 12)).toString("latin1");
+  // MP4/QuickTime/MOV: bytes 4-7 == "ftyp" (ISO BMFF)
+  if (sig.slice(4, 8) === "ftyp") return "mp4";
+  // WebM/Matroska: \x1a\x45\xdf\xa3
+  if (sig.startsWith("\x1a\x45\xdf\xa3")) return "webm";
+  return "mp4";
+}
+
+/**
+ * Download a video from a URL to an artifact file with a 200 MiB hard cap, streaming the body
+ * to avoid buffering the entire file. Format is sniffed from magic bytes.
+ */
+export async function downloadVideoToArtifact(
+  url: string,
+  budget?: VideoBudget,
+  signal?: AbortSignal,
+): Promise<string> {
+  // For data: URLs, handle inline (unlikely for video but keep parity)
+  if (url.startsWith("data:")) {
+    const commaIdx = url.indexOf(",");
+    const meta = url.slice(0, commaIdx);
+    const data = url.slice(commaIdx + 1);
+    const isBase64 = meta.includes(";base64");
+    if (!isBase64) throw new Error("non-base64 data URI for video is not supported");
+    const buf = Buffer.from(data, "base64");
+    if (budget) budget.spent += buf.byteLength;
+    if (buf.byteLength > MAX_VIDEO_DOWNLOAD_BYTES) throw new Error("video data URI exceeds size cap");
+    const ext = guessVideoExtFromMagic(buf);
+    const dir = getArtifactsDir();
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const name = `vid-${timestampPrefix()}-${crypto.randomUUID()}.${ext}`;
+    const dest = join(dir, name);
+    await writeFile(dest, buf, { mode: 0o600 });
+    return dest;
+  }
+
+  const resp = await fetch(url, { signal });
+  if (!resp.ok) throw new Error("video download failed: HTTP " + resp.status);
+
+  const dir = getArtifactsDir();
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+
+  const reader = resp.body?.getReader();
+  if (!reader) throw new Error("video download returned no body");
+
+  // Peek the first chunk for magic-byte sniffing before opening the file.
+  const first = await reader.read();
+  if (first.done || !first.value) {
+    throw new Error("video download returned empty body");
+  }
+  const ext = guessVideoExtFromMagic(first.value);
+  const name = `vid-${timestampPrefix()}-${crypto.randomUUID()}.${ext}`;
+  const dest = join(dir, name);
+  const fh = await open(dest, "w", 0o600);
+  let totalBytes = first.value.byteLength;
+  if (budget) budget.spent += totalBytes;
+  if (totalBytes > MAX_VIDEO_DOWNLOAD_BYTES) {
+    reader.releaseLock();
+    await fh.close();
+    await unlink(dest).catch(() => {});
+    throw new Error("video download exceeds size cap");
+  }
+  let success = false;
+  try {
+    await fh.writeFile(first.value);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (budget) budget.spent += value.byteLength;
+      if (totalBytes > MAX_VIDEO_DOWNLOAD_BYTES) {
+        throw new Error("video download exceeds size cap");
+      }
+      await fh.writeFile(value);
+    }
+    success = true;
+  } finally {
+    reader.releaseLock();
+    await fh.close();
+    if (!success) await unlink(dest).catch(() => {});
+  }
+  return dest;
 }

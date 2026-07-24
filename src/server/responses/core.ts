@@ -37,7 +37,7 @@ import {
   UnsupportedOAuthProviderError,
 } from "../../oauth";
 import { buildWebSearchTool, planWebSearch, runWithWebSearch, shouldResolveOpenAiWebSearchSidecar } from "../../web-search";
-import { buildImageTool, planImageBridge, runWithImageBridge } from "../../images";
+import { buildImageTool, buildVideoTool, planImageBridge, planVideoBridge, runWithImageBridge } from "../../images";
 import { describeImagesInPlace, planVisionSidecar, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
 import { createAdapterEventQueue, preflightAdapterEvents } from "../../adapters/run-turn-queue";
 import {
@@ -1449,33 +1449,46 @@ export async function handleResponses(
     return wsResponse;
   }
 
-  // Image bridge: Codex enabled image_generation but this is a routed (non-OpenAI) model that
-  // can't execute the OpenAI-hosted tool server-side. Intercept and run via xAI Grok Imagine.
+  // Media bridge: Codex enabled image_generation and/or video generation but this is a routed
+  // (non-OpenAI) model that can't execute the OpenAI-hosted tool server-side. Intercept and run
+  // via xAI Grok Imagine / Imagine Video.
   const imgPlan = planImageBridge(config, parsed, route.provider);
-  if (imgPlan && !wsPlan) {
+  const vidPlan = planVideoBridge(config, parsed, route.provider);
+  if ((imgPlan || vidPlan) && !wsPlan) {
     // The bridge forces stream:true internally and returns SSE. Non-streaming requests can't be
     // served — reject explicitly rather than returning SSE to a client expecting JSON.
     if (!parsed.stream) {
-      return new Response(JSON.stringify({ error: { message: "image bridge requires stream=true", type: "invalid_request_error", code: null } }), {
+      return new Response(JSON.stringify({ error: { message: "media bridge requires stream=true", type: "invalid_request_error", code: null } }), {
         status: 400, headers: { "Content-Type": "application/json" },
       });
     }
-    parsed.context.tools = [...(parsed.context.tools ?? []), buildImageTool()];
-    const imgResponse = await runWithImageBridge({
+    const bridgeTools = [...(parsed.context.tools ?? [])];
+    const existingNames = new Set(bridgeTools.map(t => t.name));
+    if (imgPlan && !existingNames.has("image_gen")) bridgeTools.push(buildImageTool());
+    if (vidPlan && !existingNames.has("video_gen")) bridgeTools.push(buildVideoTool());
+    parsed.context.tools = bridgeTools;
+    const mediaResponse = await runWithImageBridge({
       parsed, adapter,
-      plan: imgPlan,
+      ...(imgPlan ? { plan: imgPlan } : {}),
+      ...(vidPlan ? { videoPlan: vidPlan } : {}),
       abortSignal: options.abortSignal,
-      ...(config.images?.maxRounds != null ? { maxRounds: config.images.maxRounds } : {}),
+      ...(() => {
+        // Image-only → maxRounds (default 3). Video-only → videoMaxRounds (default 2).
+        // Both → maxRounds (image is the primary use case; lower video budget doesn't apply).
+        if (imgPlan) return config.images?.maxRounds != null ? { maxRounds: config.images.maxRounds } : {};
+        return config.images?.videoMaxRounds != null ? { maxRounds: config.images.videoMaxRounds } : {};
+      })(),
+      ...(config.images?.videoTimeoutMs ? { videoTimeoutMs: config.images.videoTimeoutMs } : {}),
       ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
     });
-    if (imgResponse.body) {
-      const imgTurnAc = new AbortController();
-      return new Response(trackStreamLifetime(imgResponse.body, imgTurnAc), {
-        status: imgResponse.status,
-        headers: imgResponse.headers,
+    if (mediaResponse.body) {
+      const mediaTurnAc = new AbortController();
+      return new Response(trackStreamLifetime(mediaResponse.body, mediaTurnAc), {
+        status: mediaResponse.status,
+        headers: mediaResponse.headers,
       });
     }
-    return imgResponse;
+    return mediaResponse;
   }
 
   const upstream = new AbortController();

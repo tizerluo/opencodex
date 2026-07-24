@@ -1,14 +1,11 @@
 /**
- * Image bridge agentic loop — adapted from src/web-search/loop.ts but significantly simpler.
+ * Media bridge agentic loop — supports both image and video generation sidecars.
  *
  * The routed (non-OpenAI) model runs in a bounded loop. Each iteration is streamed and fully
- * buffered internally. If the model calls an image-generation tool, the bridge fulfills it via
- * the xAI sidecar, injects the result as a tool_result, and loops (bounded by maxRounds). When
- * the model produces a real tool call or the budget is exhausted, the passthrough events are
- * replayed to the bridge for final SSE output.
- *
- * Removed vs web-search: no sidecar backend selection, no 429 key-failover, no forced-answer
- * nudge, no failed-query dedup, no describeImages/structuredOutput, no recordSidecarOutcome.
+ * buffered internally. If the model calls a media-generation tool (image_gen or video_gen), the
+ * bridge fulfills it via the xAI sidecar, injects the result as a tool_result, and loops (bounded
+ * by maxRounds). When the model produces a real tool call or the budget is exhausted, the
+ * passthrough events are replayed to the bridge for final SSE output.
  */
 import type { ProviderAdapter } from "../adapters/base";
 import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxThinkingContent } from "../types";
@@ -19,8 +16,10 @@ import { readBoundedResponseBody } from "../lib/bounded-body";
 import { fetchWithResetRetry } from "../lib/upstream-retry";
 import { parseStreamWithProgress, RoutedModelInactivityError, WebSearchStreamProtocolError } from "../web-search/progress-stream";
 import { fulfillImageCall } from "./fulfill";
-import { createImageBudget } from "./artifacts";
-import type { ImageBridgePlan } from "./types";
+import { parseVideoCallArgs, pollVideoWithHeartbeats, buildVideoResult, createVideoBudget } from "./fulfill-video";
+import { submitVideoJob } from "./xai-video-client";
+import { downloadVideoToArtifact, createImageBudget } from "./artifacts";
+import type { ImageBridgePlan, VideoBridgePlan, VideoCallResult } from "./types";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -40,8 +39,8 @@ interface ImageCall {
 }
 
 /**
- * Split an iteration's adapter events into (a) the image-generation tool calls to intercept and
- * (b) the events to pass through to Codex. An image tool-call's own start/delta/end events are
+ * Split an iteration's adapter events into (a) the media-generation tool calls to intercept and
+ * (b) the events to pass through to Codex. A media tool-call's own start/delta/end events are
  * dropped (Codex never sees the synthetic tool); every other event — text, thinking, real tool
  * calls, done — is preserved in order.
  */
@@ -112,6 +111,38 @@ function extractIterationThinking(events: AdapterEvent[]): OcxThinkingContent | 
   };
 }
 
+/**
+ * Inject an assistant toolCall + toolResult message pair into the conversation history.
+ * Shared by both image and video fulfillment paths.
+ */
+function injectToolResult(
+  messages: OcxMessage[],
+  call: ImageCall,
+  callIndex: number,
+  iterationThinking: OcxThinkingContent | null,
+  result: { ok: boolean },
+): void {
+  const now = Date.now();
+  let parsedArgs: Record<string, unknown> = {};
+  try { parsedArgs = JSON.parse(call.args || "{}"); } catch { /* malformed args */ }
+  messages.push({
+    role: "assistant",
+    content: [
+      ...(callIndex === 0 && iterationThinking ? [iterationThinking] : []),
+      { type: "toolCall" as const, id: call.id, name: call.name, arguments: parsedArgs },
+    ],
+    timestamp: now,
+  });
+  messages.push({
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: JSON.stringify(result),
+    isError: !result.ok,
+    timestamp: now,
+  });
+}
+
 function jsonError(status: number, message: string): Response {
   return new Response(JSON.stringify({ error: { message, type: "upstream_error", code: null } }), {
     status,
@@ -131,30 +162,42 @@ class LoopError extends Error {
 export interface ImageBridgeDeps {
   parsed: OcxParsedRequest;
   adapter: ProviderAdapter;
-  plan: ImageBridgePlan;
+  /** Image bridge plan. At least one of `plan` or `videoPlan` must be provided. */
+  plan?: ImageBridgePlan;
+  /** Video bridge plan. At least one of `plan` or `videoPlan` must be provided. */
+  videoPlan?: VideoBridgePlan;
   abortSignal?: AbortSignal;
   onFirstOutput?: () => void;
-  /** Max image-generation rounds before forcing a final answer. Defaults to 3. */
+  /** Max generation rounds before forcing a final answer. Defaults to 3. */
   maxRounds?: number;
+  /** Per-video generation timeout (ms) including polling. Defaults to 300000 (5 min). */
+  videoTimeoutMs?: number;
 }
 
 /**
  * Run the main (non-OpenAI) model in a small agentic loop. Each upstream iteration is streamed and
  * fully buffered internally so raw byte progress is observable without leaking the synthetic tool or
- * preliminary assistant output. If the model invokes image generation, run it via the xAI sidecar,
- * inject the answer as a tool_result, and loop (bounded by `maxRounds`).
+ * preliminary assistant output. If the model invokes image or video generation, run it via the xAI
+ * sidecar, inject the answer as a tool_result, and loop (bounded by `maxRounds`).
  */
 export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Response> {
-  const { parsed, adapter, plan, abortSignal } = deps;
+  const { parsed, adapter, plan, videoPlan, abortSignal } = deps;
   const maxRounds = deps.maxRounds ?? DEFAULT_MAX_ROUNDS;
+  const videoTimeoutMs = deps.videoTimeoutMs ?? 300_000;
   const HARD_CAP = maxRounds + 1;
+
+  // Merge tool names from both plans so the scanner can intercept image_gen and video_gen calls.
+  const mediaToolNames = new Set<string>();
+  if (plan) for (const n of plan.toolNames) mediaToolNames.add(n);
+  if (videoPlan) for (const n of videoPlan.toolNames) mediaToolNames.add(n);
 
   const messages: OcxMessage[] = [...parsed.context.messages];
   const allTools = parsed.context.tools ?? [];
-  // For the forced-final pass we drop image tools so the model MUST answer from the results already
+  // For the forced-final pass we drop media tools so the model MUST answer from the results already
   // in `messages` (can't generate again) — this guarantees a non-empty final answer.
-  const toolsNoImage = allTools.filter(t => !t.imageGeneration);
+  const toolsNoMedia = allTools.filter(t => !t.imageGeneration && !t.videoGeneration);
   const budget = createImageBudget();
+  const vBudget = createVideoBudget();
 
   // Link an internal AbortController to the turn signal so a client cancel of the SSE body aborts
   // in-flight model fetches AND the sidecar.
@@ -177,7 +220,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
   const prepareIterationEvents = async function* (forceFinal: boolean): AsyncGenerator<AdapterEvent, IterationResponse> {
     const iterParsed: OcxParsedRequest = {
       ...parsed, stream: true,
-      context: { ...parsed.context, messages, tools: forceFinal ? toolsNoImage : allTools },
+      context: { ...parsed.context, messages, tools: forceFinal ? toolsNoMedia : allTools },
     };
     const headerDeadline = clearableDeadline(CONNECT_TIMEOUT_MS, signal);
     try {
@@ -272,7 +315,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
     }
     const terminal = events[terminalIndexes[0]!];
     if (terminal.type === "error") throw new LoopError(502, terminal.message);
-    return scanEventsForImageCall(events, plan.toolNames);
+    return scanEventsForImageCall(events, mediaToolNames);
   };
 
   // Eagerly acquire only the FIRST iteration's final headers so connect/header/HTTP failures remain
@@ -320,34 +363,68 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
             return;
           }
 
-          // Fulfill each image call, then inject assistant + toolResult into messages.
+          // Fulfill each media call, then inject assistant + toolResult into messages.
           const iterationThinking = extractIterationThinking(split.passthrough);
           for (const [callIndex, call] of split.calls.entries()) {
-            yield { type: "heartbeat" };
-            const result = await fulfillImageCall(
-              { id: call.id, name: call.name, arguments: call.args },
-              plan, budget, signal,
-            );
-            if (signal.aborted) throw new LoopError(499, "client closed request during image-bridge");
-            const now = Date.now();
-            let parsedArgs: Record<string, unknown> = {};
-            try { parsedArgs = JSON.parse(call.args || "{}"); } catch { /* malformed args */ }
-            messages.push({
-              role: "assistant",
-              content: [
-                ...(callIndex === 0 && iterationThinking ? [iterationThinking] : []),
-                { type: "toolCall" as const, id: call.id, name: call.name, arguments: parsedArgs },
-              ],
-              timestamp: now,
-            });
-            messages.push({
-              role: "toolResult",
-              toolCallId: call.id,
-              toolName: call.name,
-              content: JSON.stringify(result),
-              isError: !result.ok,
-              timestamp: now,
-            });
+            const isVideoCall = videoPlan?.toolNames.has(call.name) === true;
+
+            if (isVideoCall) {
+              // === Video path: submit → poll with heartbeats → download ===
+              yield { type: "heartbeat" };
+              const vArgs = parseVideoCallArgs(call.args);
+              let vResult: VideoCallResult;
+              if (!vArgs.ok) {
+                vResult = { ok: false, model: videoPlan!.model, prompt: "", files: [], count: 0, error: vArgs.error };
+              } else {
+                try {
+                  const { requestId } = await submitVideoJob(
+                    {
+                      prompt: vArgs.prompt, model: videoPlan!.model,
+                      ...(vArgs.duration != null ? { duration: vArgs.duration } : {}),
+                      ...(vArgs.resolution != null ? { resolution: vArgs.resolution } : {}),
+                      ...(vArgs.aspectRatio != null ? { aspectRatio: vArgs.aspectRatio } : {}),
+                    },
+                    videoPlan!.auth, signal,
+                  );
+                  // Consume the polling generator, forwarding heartbeats to the SSE stream.
+                  const pollGen = pollVideoWithHeartbeats(requestId, videoPlan!.auth, signal, videoTimeoutMs);
+                  let pollResult: { ok: true; videoUrl: string } | { ok: false; error: string };
+                  try {
+                    for (;;) {
+                      const { value, done } = await pollGen.next();
+                      if (done) { pollResult = value; break; }
+                      yield value; // forward heartbeat to SSE
+                    }
+                  } finally {
+                    // Ensure the generator is cleaned up if the loop exits early (e.g. abort).
+                    await pollGen.return({ ok: false, error: "cancelled" }).catch(() => {});
+                  }
+                  if (signal.aborted) throw new LoopError(499, "client closed request during video-bridge");
+                  if (pollResult.ok) {
+                    const path = await downloadVideoToArtifact(pollResult.videoUrl, vBudget, signal);
+                    vResult = buildVideoResult(path, vArgs.prompt, videoPlan!.model);
+                  } else {
+                    vResult = { ok: false, model: videoPlan!.model, prompt: vArgs.prompt, files: [], count: 0, error: pollResult.error };
+                  }
+                } catch (e) {
+                  if (signal.aborted) throw new LoopError(499, "client closed request during video-bridge");
+                  const error = e instanceof Error ? e.message : String(e);
+                  vResult = { ok: false, model: videoPlan!.model, prompt: vArgs.prompt ?? "", files: [], count: 0, error };
+                }
+              }
+              if (signal.aborted) throw new LoopError(499, "client closed request during video-bridge");
+              injectToolResult(messages, call, callIndex, iterationThinking, vResult);
+            } else {
+              // === Image path ===
+              if (!plan) throw new LoopError(500, "internal error: image plan missing for non-video tool call");
+              yield { type: "heartbeat" };
+              const result = await fulfillImageCall(
+                { id: call.id, name: call.name, arguments: call.args },
+                plan, budget, signal,
+              );
+              if (signal.aborted) throw new LoopError(499, "client closed request during image-bridge");
+              injectToolResult(messages, call, callIndex, iterationThinking, result);
+            }
           }
         } catch (e) {
           yield { type: "error", message: e instanceof LoopError ? e.message : (e instanceof Error ? e.message : String(e)) };

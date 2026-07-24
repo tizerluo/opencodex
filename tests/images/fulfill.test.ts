@@ -23,6 +23,10 @@ mock.module("../../src/images/artifacts", () => ({
   createImageBudget: () => ({ spent: 0 }),
   materializeInlineImage: async () => materializeFn(matIdx++),
   downloadImageToArtifact: async () => downloadFn(dlIdx++),
+  // Re-export video artifacts so other modules importing from ./artifacts resolve correctly.
+  createVideoBudget: () => ({ spent: 0 }),
+  downloadVideoToArtifact: async () => "/test/vid-0.mp4",
+  guessVideoExtFromMagic: () => "mp4",
 }));
 
 const { fulfillImageCall } = await import("../../src/images/fulfill");
